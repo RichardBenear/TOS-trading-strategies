@@ -1,0 +1,607 @@
+
+###################################################
+#########   PMO Coherent Pulse Strategy   #########
+# Multi-band PMO filter-bank with coherent detection,
+# regime gating, gap protection, and fast momentum exits.
+# Optimized for 5–10 minute timeframes.
+###################################################
+# Author: Richard Benear
+#Hint: A long/short strategy with multibandwidth PMO filters and a \nchannel detector, gap detector, and extreme Rate-Of-Change (ROC) detector.
+#==================================================
+# Contributors:
+#  1) FPL Extended P&L for backtesting
+#     Author: Eddielee394
+#     Version: 1.2
+#     inspired by FPL Dashboard script developed by Mobius
+#     Added Max Draw Down label - R. Benear 12-17-2025
+#  2) ChatGPT5 - Custom PMO using Signal Processing concepts
+##################################################
+# 
+# This strategy does the following:
+# 1) The first stage is a 3-band, multi-pole low-pass filter bank (remove high frequencies)
+#    where each PMO is a 2-pole IIR filter tuned to a different bandwidth
+#    then coherent detection of the trend is determined by requiring all three filters to agree.
+# 2) Then gate the detector output with a channel detector (customized TTM squeeze).
+#    If in the channel, then new trades are blocked but trades can still be exited.
+# 3) Additionally, opening gap downs are detected and short entry trades are blocked
+#    for X number bars since Buy-the-Dip (BTFD) mentality is prevalent.
+# 4) Fast ROC events are detected that go against the trade with early exit
+#
+# In communications theory, the PMO filter is extremely similar to:
+# A 3-stage cascaded envelope-detector filter bank used in digital demodulation,
+# especially in systems that must reject noise, jitter, and multi-path interference.
+
+def timeFrame = GetAggregationPeriod();
+DefineGlobalColor("LightBlue", CreateColor(50, 120, 255));
+
+def CloseAllCondition = if SecondsTillTime(1559) == 0 then 1 else 0;
+def EOD = if SecondsTillTime(1559) <= 900 then 674 else 0;
+
+input startTradeTime = 0930;
+input endTradeTime   = 1539;   
+
+# No trade initiation within 20 min of close
+def isActiveTime =
+    SecondsFromTime(startTradeTime) >= 0 and
+    SecondsTillTime(endTradeTime) >= 0;
+
+input showPmoPeriodLabels = yes;
+input showFplLabels = yes;
+input useGapDownGate   = yes;  #hint: turn gate on/off
+input gapBlockBars     = 8;    #hint: number of bars after open to block shorts
+input gapPctThreshold  = 0.6;  #hint: min gap %, 0.5 = 0.5% gap down
+
+###############################################
+# PMO Filter Bank via Target Periods + Speed
+###############################################
+
+# Target periods in bars for each PMO band
+# these are "baseline" periods before speedFactor
+input longTargetPeriodLow  = 8;   
+input longTargetPeriodMid  = 14;  
+input longTargetPeriodHigh = 30;  
+input shortTargetPeriodLow  = 8;   
+input shortTargetPeriodMid  = 12;  
+input shortTargetPeriodHigh = 26;  
+
+# Master speed control:
+#  - 1.0 = baseline (uses targetPeriodX as-is)
+#  - >1.0 = faster (shorter effective period)
+#  - <1.0 = slower (longer effective period)
+input pmoSpeedMult = 1.0; #hint: global multiplier for all PMO periods. >1.0 = shorter period
+input longSignalSensitivity = 2.5; #hint: 
+input shortSignalSensitivity = 2.0; # market falls faster than it goes up
+
+#------------------------------------------------
+# Effective periods after speed scaling
+#   effectivePeriod = targetPeriod / speedFactor
+#   (so speedFactor > 1 => shorter, faster)
+#------------------------------------------------
+def lEffLowP  = Max(1, longTargetPeriodLow  / pmoSpeedMult);
+def lEffMidP  = Max(1, longTargetPeriodMid  / pmoSpeedMult);
+def lEffHighP = Max(1, longTargetPeriodHigh / pmoSpeedMult);
+def sEffLowP  = Max(1, shortTargetPeriodLow  / pmoSpeedMult);
+def sEffMidP  = Max(1, shortTargetPeriodMid  / pmoSpeedMult);
+def sEffHighP = Max(1, shortTargetPeriodHigh / pmoSpeedMult);
+
+#------------------------------------------------
+# Rule-of-thumb for filter mapping:
+#   length1 ≈ P / 2
+#   length2 ≈ P / 3  (could use /4 if you want even "tighter")
+#   signal ≈ P / 3   (programmable, use /2 if you want more responsive crosses)
+#------------------------------------------------
+# Low band
+def lPmoLowLength1_raw      = lEffLowP / 2.0;
+def lPmoLowLength2_raw      = lEffLowP / 3.0;
+def lPmoLowSignalLength_raw = lEffLowP / longSignalSensitivity;
+def sPmoLowLength1_raw      = sEffLowP / 2.0;
+def sPmoLowLength2_raw      = sEffLowP / 3.0;
+def sPmoLowSignalLength_raw = sEffLowP / shortSignalSensitivity;
+
+def lPmoLowLength1      = Max(1, Round(lPmoLowLength1_raw,      0));
+def lPmoLowLength2      = Max(1, Round(lPmoLowLength2_raw,      0));
+def lPmoLowSignalLength = Max(1, Round(lPmoLowSignalLength_raw, 0));
+def sPmoLowLength1      = Max(1, Round(sPmoLowLength1_raw,      0));
+def sPmoLowLength2      = Max(1, Round(sPmoLowLength2_raw,      0));
+def sPmoLowSignalLength = Max(1, Round(sPmoLowSignalLength_raw, 0));
+
+# Mid band
+def lPmoMidLength1_raw      = lEffMidP / 2.0;
+def lPmoMidLength2_raw      = lEffMidP / 3.0;
+def lPmoMidSignalLength_raw = lEffMidP / longSignalSensitivity;
+def sPmoMidLength1_raw      = sEffMidP / 2.0;
+def sPmoMidLength2_raw      = sEffMidP / 3.0;
+def sPmoMidSignalLength_raw = sEffMidP / shortSignalSensitivity;
+
+def lPmoMidLength1      = Max(1, Round(lPmoMidLength1_raw,      0));
+def lPmoMidLength2      = Max(1, Round(lPmoMidLength2_raw,      0));
+def lPmoMidSignalLength = Max(1, Round(lPmoMidSignalLength_raw, 0));
+def sPmoMidLength1      = Max(1, Round(sPmoMidLength1_raw,      0));
+def sPmoMidLength2      = Max(1, Round(sPmoMidLength2_raw,      0));
+def sPmoMidSignalLength = Max(1, Round(sPmoMidSignalLength_raw, 0));
+
+# High band
+def lPmoHighLength1_raw      = lEffHighP / 2.0;
+def lPmoHighLength2_raw      = lEffHighP / 3.0;
+def lPmoHighSignalLength_raw = lEffHighP / longSignalSensitivity;
+def sPmoHighLength1_raw      = sEffHighP / 2.0;
+def sPmoHighLength2_raw      = sEffHighP / 3.0;
+def sPmoHighSignalLength_raw = sEffHighP / shortSignalSensitivity;
+
+def lPmoHighLength1      = Max(1, Round(lPmoHighLength1_raw,      0));
+def lPmoHighLength2      = Max(1, Round(lPmoHighLength2_raw,      0));
+def lPmoHighSignalLength = Max(1, Round(lPmoHighSignalLength_raw, 0));
+def sPmoHighLength1      = Max(1, Round(sPmoHighLength1_raw,      0));
+def sPmoHighLength2      = Max(1, Round(sPmoHighLength2_raw,      0));
+def sPmoHighSignalLength = Max(1, Round(sPmoHighSignalLength_raw, 0));
+
+# Labels to see what PMO periods you're actually using
+AddLabel(
+   showPmoPeriodLabels,
+    "\n" +
+    "PLonglow=" + leffLowP
+    + "  L:[" + lpmoLowLength1  + "," + lpmoLowLength2  + "," + lpmoLowSignalLength  + "]"
+    + "  P_mid=" + leffMidP
+    + "  M:[" + lpmoMidLength1  + "," + lpmoMidLength2  + "," + lpmoMidSignalLength  + "]"
+    + "  P_high=" + leffHighP
+    + "  H:[" + lpmoHighLength1 + "," + lpmoHighLength2 + "," + lpmoHighSignalLength + "]",
+    Color.PINK
+);
+AddLabel(
+   showPmoPeriodLabels,
+    "\n" +
+    "PShortlow=" + seffLowP
+    + "  L:[" + spmoLowLength1  + "," + spmoLowLength2  + "," + spmoLowSignalLength  + "]"
+    + "  P_mid=" + seffMidP
+    + "  M:[" + spmoMidLength1  + "," + spmoMidLength2  + "," + spmoMidSignalLength  + "]"
+    + "  P_high=" + seffHighP
+    + "  H:[" + spmoHighLength1 + "," + spmoHighLength2 + "," + spmoHighSignalLength + "]",
+    Color.GREEN
+);
+AddLabel(showPmoPeriodLabels,  "\n" + "speed=" + AsText(pmoSpeedMult), Color.GRAY);
+
+#################################################
+# Quick exit
+# Markets fall faster than they go up and many times have "V" bottoms
+#################################################
+def tr  = TrueRange(high, close, low);
+def atr = MovingAverage(AverageType.WILDERS, tr, 14);
+
+input longDropAtrMult    = 1.0;  # exit long if bar down > 1x ATR
+input shortBounceAtrMult = 1.0;  # exit short if bar up > 1x ATR
+
+def barChange = close - close[1];
+
+def fastLongExitRaw  = barChange <= -longDropAtrMult * atr;
+def fastShortExitRaw = barChange >=  shortBounceAtrMult * atr;
+
+def fastLongExit  = fastLongExitRaw and !fastLongExitRaw[1];
+def fastShortExit = fastShortExitRaw and !fastShortExitRaw[1];
+
+################################################################
+##########                 PMO                      ###########
+################################################################
+def longPrimaryPMO_l = reference PMO(price = close[-1], length1 = lPmoLowLength1, length2 = lPmoLowLength2);
+def longPrimarySignalLine_l = ExpAverage(longPrimaryPMO_l, lPmoLowSignalLength);
+
+def longPrimaryPMO_m = reference PMO(price = close[-1], length1 = lPmoMidLength1, length2 = lPmoMidLength2);
+def longPrimarySignalLine_m = ExpAverage(longPrimaryPMO_m, lPmoMidSignalLength);
+
+def longPrimaryPMO_h = reference PMO(price = close[-1], length1 = lPmoHighLength1, length2 = lPmoHighLength2);
+def longPrimarySignalLine_h = ExpAverage(longPrimaryPMO_h, lPmoHighSignalLength);
+
+def shortPrimaryPMO_l = reference PMO(price = close[-1], length1 = sPmoLowLength1, length2 = sPmoLowLength2);
+def shortPrimarySignalLine_l = ExpAverage(shortPrimaryPMO_l, sPmoLowSignalLength);
+
+def shortPrimaryPMO_m = reference PMO(price = close[-1], length1 = sPmoMidLength1, length2 = sPmoMidLength2);
+def shortPrimarySignalLine_m = ExpAverage(shortPrimaryPMO_m, sPmoMidSignalLength);
+
+def shortPrimaryPMO_h = reference PMO(price = close[-1], length1 = sPmoHighLength1, length2 = sPmoHighLength2);
+def shortPrimarySignalLine_h = ExpAverage(shortPrimaryPMO_h, sPmoHighSignalLength);
+
+#################################################################
+############          SCAN Variables                    #########
+#################################################################
+def Uptrend;
+def DownTrend;
+
+    if 
+        longPrimaryPMO_h > longPrimarySignalLine_h  and
+        longPrimaryPMO_m > longPrimarySignalLine_m and 
+        longPrimaryPMO_l > longPrimarySignalLine_l {
+        Uptrend = 1;
+    } else {
+        Uptrend = 0;
+    }
+
+    if
+        shortPrimaryPMO_h < shortPrimarySignalLine_h and
+        shortPrimaryPMO_m < shortPrimarySignalLine_m and 
+        shortPrimaryPMO_l < shortPrimarySignalLine_l {
+        DownTrend = 1;
+    } else {
+        DownTrend = 0;
+    }
+
+def ExitUpTrend;
+def ExitDownTrend;
+
+ExitUpTrend = if longPrimaryPMO_h < longPrimarySignalLine_h and longPrimaryPMO_m < longPrimarySignalLine_m and longPrimaryPMO_l < longPrimarySignalLine_l then 1 else 0;
+
+ExitDownTrend = if  shortPrimaryPMO_h > shortPrimarySignalLine_h and shortPrimaryPMO_m > shortPrimarySignalLine_m and shortPrimaryPMO_l > shortPrimarySignalLine_l then 1 else 0;
+
+###############################################
+# Simple "TTM-style" Squeeze / Channel Filter
+#  - inChannel = 1 when BB inside Keltner
+###############################################
+
+input inChannelLength = 20;      # lookback for BB & Keltner
+input numBBDev        = 2.0;     # Bollinger Band std dev
+input keltnerAtrMult  = 1.5;     # Keltner ATR multiplier
+
+# --- Center line (shared by BB & Keltner) ---
+def basis = MovingAverage(AverageType.WILDERS, close, inChannelLength);
+
+# --- Bollinger Bands ---
+def bbStDev  = StDev(close, inChannelLength);
+def bbUpper  = basis + numBBDev * bbStDev;
+def bbLower  = basis - numBBDev * bbStDev;
+
+# --- Keltner Channels ---
+def kctr       = TrueRange(high, close, low);
+def kcatr      = Average(kctr, inChannelLength);
+def kcUpper  = basis + keltnerAtrMult * kcatr;
+def kcLower  = basis - keltnerAtrMult * kcatr;
+
+# --- "TTM-like" squeeze / channel condition ---
+# In squeeze/channel when BOTH BB's are inside Keltner
+def inChannel = (bbUpper < kcUpper) and (bbLower > kcLower);
+
+######################################
+# Optional display gray bars when in channel
+######################################
+
+#def top = Max(open, close);
+#def bottom = Min(open, close);
+
+# Paint Bars gray if in the channel
+#AddCloud(
+#    if inChannel then high else Double.NaN,
+#    if inChannel then low  else Double.NaN,
+#    Color.LIGHT_GRAY,
+#    Color.LIGHT_GRAY
+#);
+
+#AssignPriceColor(
+#    if inChannel
+#    then Color.GRAY
+#    else Color.CURRENT
+#);
+
+########################################
+# Gap-Down Gate for Short Entries
+# - Detect gap down at first bar of day
+# - Block shorts for first N bars if gap down
+########################################
+
+def day      = GetDay();
+def newDay   = day <> day[1];
+
+# % gap from yesterday close to today's open
+def gapPct = if newDay and !IsNaN(close[1]) then
+                 (open - close[1]) / close[1] * 100
+             else 0;
+
+# True if today's session opened with a sufficiently large gap down
+def gapDownAtOpenRaw =
+    newDay and
+    gapPct <= -gapPctThreshold;    # negative and beyond threshold
+
+# Persist this info for the whole day
+def gapDownToday =
+    if newDay then gapDownAtOpenRaw
+    else gapDownToday[1];
+
+# Bars since today's open
+def barsFromOpen =
+    if newDay then 0
+    else barsFromOpen[1] + 1;
+
+# Final gate condition: block shorts if we had a gap-down open and we are
+# still within the first gapBlockBars bars of the session.
+def blockShortsForGap =
+    useGapDownGate and
+    gapDownToday and
+    barsFromOpen < gapBlockBars;
+
+#===============================================
+# Constrain short hold time if in long term uptrend
+# Get out of short trade sooner if in long term uptrend
+def longTermUp = MovingAverage(AverageType.EXPONENTIAL, close, 240);
+def longUpTrend = if close > longTermUp then 1 else 0;
+
+#===============================================
+# Create the buy / sell triggers
+#===============================================
+def myEntryPrice = EntryPrice();
+def inAPosition  = !IsNaN(myEntryPrice);
+def entryOK = isActiveTime and !inAPosition and !inChannel;
+def exitOK = isActiveTime and inAPosition;
+
+def LongBuy = if (entryOK and Uptrend == 1 and Uptrend[1] == 0)
+              then 1 else 0;
+
+def LongExit = if (exitOK and ExitUpTrend == 1 and ExitUpTrend[1] == 0)
+                  or (exitOK and fastLongExit)
+               then 1 else 0;
+
+def ShortSell = if (entryOK and DownTrend == 1 and DownTrend[1] == 0 and 
+                    !blockShortsForGap)
+                then 1 else 0;
+
+def ShortExit = if (exitOK and ExitDownTrend == 1) 
+                    or (exitOK and fastShortExit)
+                 then 1 else 0;
+
+AddOrder(OrderType.BUY_TO_OPEN, LongBuy == 1, price = open, tickcolor = Color.GREEN, arrowcolor = Color.GREEN, name = "BUY to open");
+
+AddOrder(OrderType.SELL_TO_CLOSE, LongExit == 1, price = open, tickcolor = Color.GREEN, arrowcolor = Color.GREEN, name = "Sell To Close");
+
+AddOrder(OrderType.SELL_TO_OPEN, ShortSell == 1, price = open, tickcolor = Color.RED, arrowcolor = Color.RED, name = "SELL to open");
+
+AddOrder(OrderType.BUY_TO_CLOSE, ShortExit == 1, price = open, tickcolor = Color.RED, arrowcolor = Color.RED, name = "BUY To Close");
+
+
+#################################################################
+############          FPL Extended                      #########
+#################################################################
+#Author: Eddielee394
+#An extended floating P&L study to be used alongside TOS strategies for measuring hypothetical strategy performance.\nThis is a work in progress.  And may contain some bugs or other programming issues.
+
+############################
+# Instructions
+# - Due to limitations with the thinkscript public api, this specific script must be added to a "strategy" study.
+#   Generally best practice is to append this script to the end of your custom strategy (ensuring it runs AFTER the
+#   `AddOrder()` function is called from the strategy).  A better method would be to use as a lower study but unless
+#    a workaround is implemented to handle the `Entry()` function in a lower study, it can only be applied to upper strategies.
+#
+# - the script uses the `HidePrice()` function which will hide the actual price candles within the upper study,
+#   only displaying the FPL histogram.
+#
+############################
+
+############################
+#    Metrics              
+#  - Active Trade return %
+#  - Entry Count          
+#  - Winning Entry Count  
+#  - Win rate            
+#  - Avg return          
+#  - avg win              
+#  - avg loss            
+#  - peak to valley dd    
+#  - largest equity dd    
+#  - P&L low              
+#  - P&L high            
+#  - Highest return    
+#  - Lowest return      
+############################
+
+############################
+#     Todo:              
+# - Sharpe Ratio    
+# - Sortino Ratio    
+# - Calmar Ratio    
+# - Avg trade          
+#   duration            
+# -Buy/hold comparison    
+############################
+
+#Globals
+def nan = Double.NaN;
+def bn = if !IsNaN(close) and !IsNaN(close[1]) and !IsNaN(close[-1]) then BarNumber() else bn[1];
+
+#Inputs
+def fplTargetWinLoss = .50;
+#hint fplTargetWinLoss: sets the target winlossRatio (in percent) which determines display colors of the W/L label.
+
+def fplTargetWinRate = 1;
+#hint fplTargetWinRate: sets the target winRate (float) which determines display colors of the WinRate label;
+
+def fplHidePrice = no;
+#hint fplHidePrice: hide's the underlying price graph. \nDefault is no.
+
+def fplHideFPL = yes;
+#hint fplHideFPL: hide's the underlying P&L graph.\nDefault is yes.
+
+#temp input var references
+def targetWinLoss = fplTargetWinLoss;
+def targetWinRate = fplTargetWinRate;
+def hidePrice = fplHidePrice;
+def hideFPL = fplHideFPL;
+
+#hide chart candles
+HidePricePlot(hidePrice);
+
+#Plot default Floating P&L
+plot FPL = FPL();
+FPL.SetPaintingStrategy(PaintingStrategy.SQUARED_HISTOGRAM);
+FPL.DefineColor("Positive and Up", Color.GREEN);
+FPL.DefineColor("Positive and Down", Color.DARK_GREEN);
+FPL.DefineColor("Negative and Down", Color.RED);
+FPL.DefineColor("Negative and Up", Color.DARK_RED);
+FPL.AssignValueColor(if FPL >= 0
+                            then if FPL > FPL[1]
+                            then FPL.Color("Positive and Up")
+                            else FPL.Color("Positive and Down")
+                            else if FPL < FPL[1]
+                            then FPL.Color("Negative and Down")
+                            else FPL.Color("Negative and Up"));
+FPL.SetHiding(hideFPL);
+
+plot ZeroLine = if IsNaN(close)
+                then nan
+                else 0;
+ZeroLine.SetDefaultColor(Color.GRAY);
+ZeroLine.SetHiding(hideFPL);
+
+#==========================
+# Max Drawdown 
+#==========================
+def fplPeak = CompoundValue(1,
+    if IsNaN(fplPeak[1]) then FPL
+    else Max(fplPeak[1], FPL),
+    FPL);
+
+def fplDrawdown = fplPeak - FPL;   # dollars below peak (>= 0)
+def maxDrawdown = HighestAll(fplDrawdown);
+
+#Global Scripts
+script incrementValue {
+    input condition = yes;
+    input increment =  1;
+    input startingValue = 0;
+
+    def _value = CompoundValue(1,
+                 if condition
+                 then _value[1] + increment
+                 else _value[1], startingValue);
+
+    plot incrementValue = _value;
+}
+;
+
+# Entry Calculations.  Note: Only parses on a Strategy Chart
+def entry = EntryPrice();
+
+def entryPrice = if !IsNaN(entry)
+                 then entry
+                 else entryPrice[1];
+
+def hasEntry = !IsNaN(entry);
+
+def isNewEntry = entryPrice != entryPrice[1];
+
+#is active trade
+def highFPL = HighestAll(FPL);
+def lowFPL = LowestAll(FPL);
+
+def fplreturn = (FPL - FPL[1]) / FPL[1];
+def cumsum = Sum(fplreturn);
+
+def highBarNumber = CompoundValue(1, if FPL == highFPL
+                                     then bn
+                                     else highBarNumber[1], 0);
+
+def lowBarNumber = CompoundValue(1, if FPL == lowFPL
+                                    then bn
+                                    else lowBarNumber[1], 0);
+
+#Win/Loss ratios
+def entryBarsTemp = if hasEntry
+                    then bn
+                    else nan;
+
+def entryBarNum = if hasEntry and isNewEntry
+                  then bn
+                  else entryBarNum[1];
+
+def isEntryBar = entryBarNum != entryBarNum[1];
+
+def entryBarPL = if isEntryBar
+                 then FPL
+                 else entryBarPL[1];
+
+def exitBarsTemp = if !hasEntry
+                   and bn > entryBarsTemp[1]
+                   then bn
+                   else nan;
+
+def exitBarNum = if !hasEntry and !IsNaN(exitBarsTemp[1])
+                 then bn
+                 else exitBarNum[1];
+
+def isExitBar = exitBarNum != exitBarNum[1];
+
+def exitBarPL = if isExitBar
+                then FPL
+                else exitBarPL[1];
+
+def entryReturn = if isExitBar then exitBarPL - exitBarPL[1] else entryReturn[1];
+def isWin = if isExitBar and entryReturn >= 0 then 1 else 0;
+def isLoss = if isExitBar and entryReturn < 0 then 1 else 0;
+def entryReturnWin = if isWin then entryReturn else entryReturnWin[1];
+def entryReturnLoss = if isLoss then entryReturn else entryReturnLoss[1];
+def entryFPLWins = if isWin then entryReturn else 0;
+def entryFPLLosses = if isLoss then entryReturn else 0;
+def entryFPLAll = if isLoss or isWin then entryReturn else 0;
+
+#Counts
+def entryCount = incrementValue(entryFPLAll);
+def winCount = incrementValue(isWin);
+def lossCount = incrementValue(isLoss);
+
+def highestReturn = if entryReturnWin[1] > highestReturn[1]
+                    then entryReturnWin[1]
+                    else highestReturn[1];
+
+def lowestReturn = if entryReturnLoss[1] < lowestReturn[1]
+                   then entryReturnLoss[1]
+                   else lowestReturn[1];
+
+
+def winRate = winCount / lossCount;
+def winLossRatio = winCount / entryCount;
+def avgReturn = TotalSum(entryFPLAll) / entryCount;
+def avgWin = TotalSum(entryFPLWins) / winCount;
+def avgLoss = TotalSum(entryFPLLosses) / lossCount;
+
+#Daily profit
+def Midnight = if isActiveTime then FPL else Midnight[1];
+def DaysProfit = FPL - Midnight;
+
+#Labels
+
+AddLabel(showFplLabels,
+         text = "Total Trades: " + entryCount,
+         color = GlobalColor("LightBlue")
+         );
+
+AddLabel(showFplLabels,
+         text = "WinCount: " + winCount +
+                " | LossCount: " + lossCount +
+                " | WinRate: " + winRate,
+         color = if winRate >= targetWinRate
+                 then Color.LIME
+                 else Color.PLUM
+         );
+
+AddLabel(showFplLabels,
+         text = "W/L: " + AsPercent(winLossRatio) + "\n",
+         color = if winLossRatio > targetWinLoss
+                 then Color.LIGHT_GREEN
+                 else Color.LIGHT_RED
+         );
+
+AddLabel(showFplLabels,
+         text = "AvgReturn: " + AsDollars(avgReturn) +
+                " | AvgWin: " + AsDollars(avgWin) +
+                " | AvgLoss: " + AsDollars(avgLoss) + "\n",
+         color = if avgReturn >= 0
+                 then Color.LIGHT_GRAY
+                 else Color.ORANGE
+         );
+
+AddLabel(showFplLabels,
+         text = "Total Profit: " + AsDollars(FPL) + "\n",
+         color = if FPL > 0
+                 then Color.GREEN
+                 else Color.RED
+        );
+
+AddLabel(showFplLabels,
+    text = "Max DD: " + AsDollars(maxDrawdown),
+    color = if maxDrawdown <= 0 then Color.LIGHT_GREEN else Color.LIGHT_RED);
+
+
+
